@@ -29,9 +29,14 @@ def run_pose_judgement(pose_data: dict[str, Any], config: dict[str, Any]) -> dic
     joint_names = pose_data["joint_names"]
     total_frame_count = min(left.shape[0], right.shape[0])
 
-    fused = ((left[:total_frame_count] + right[:total_frame_count]) / 2.0).astype(float)
+    fused_prior = _initial_fused_pose(pose_data, left, right, total_frame_count)
+    fused = fused_prior.copy()
+    pose_update_mode = str(config.get("judgement_pose_update", "off"))
+    blend_alpha = float(config.get("judgement_blend_alpha", 0.2))
+    max_joint_shift_m = float(config.get("judgement_max_joint_shift_m", 0.15))
     source_view = []
     errors = []
+    pose_update_stats = []
     z_buffer_frames = 0
     max_frames = config.get("max_judgement_frames")
     frame_count = total_frame_count
@@ -70,7 +75,15 @@ def run_pose_judgement(pose_data: dict[str, Any], config: dict[str, Any]) -> dic
             )
             opt1 = result["optimized"]["camera1"]
             opt2 = result["optimized"]["camera2"]
-            fused[frame_idx] = _joint_dicts_to_average_array(opt1, opt2, joint_names)
+            candidate = _joint_dicts_to_average_array(opt1, opt2, joint_names)
+            fused[frame_idx], update_stat = _apply_pose_update(
+                fused_prior[frame_idx],
+                candidate,
+                mode=pose_update_mode,
+                blend_alpha=blend_alpha,
+                max_joint_shift_m=max_joint_shift_m,
+            )
+            pose_update_stats.append(update_stat)
             source_view.append(
                 {
                     "frame": frame_idx,
@@ -85,10 +98,10 @@ def run_pose_judgement(pose_data: dict[str, Any], config: dict[str, Any]) -> dic
                 }
             )
         except Exception as exc:
-            fused[frame_idx] = (left[frame_idx] + right[frame_idx]) / 2.0
+            fused[frame_idx] = fused_prior[frame_idx]
             errors.append({"frame": frame_idx, "error": str(exc)})
-            source_view.append({"frame": frame_idx, "fallback": "mean", "error": str(exc)})
-            print(f"    J: frame {frame_idx + 1} loi, fallback mean: {exc}", flush=True)
+            source_view.append({"frame": frame_idx, "fallback": "prior_pose", "error": str(exc)})
+            print(f"    J: frame {frame_idx + 1} loi, fallback prior pose: {exc}", flush=True)
 
         if _should_log_progress(frame_idx, frame_count, log_interval):
             elapsed = time.perf_counter() - start
@@ -138,6 +151,13 @@ def run_pose_judgement(pose_data: dict[str, Any], config: dict[str, Any]) -> dic
         "seconds": round(elapsed, 3),
         "seconds_per_frame": round(seconds_per_frame, 3),
         "progress_log": progress_log,
+        "pose_update": {
+            "mode": pose_update_mode,
+            "blend_alpha": blend_alpha,
+            "max_joint_shift_m": max_joint_shift_m,
+            "stats": _summarize_pose_updates(pose_update_stats),
+            "note": "off keeps the incoming pose from R and uses J only for judgement metadata.",
+        },
         "errors": errors[:20],
         "error_count": len(errors),
     }
@@ -147,6 +167,89 @@ def run_pose_judgement(pose_data: dict[str, Any], config: dict[str, Any]) -> dic
         f"({seconds_per_frame:.2f}s/frame, errors={len(errors)})"
     )
     return pose_data
+
+
+def _initial_fused_pose(
+    pose_data: dict[str, Any],
+    left: np.ndarray,
+    right: np.ndarray,
+    total_frame_count: int,
+) -> np.ndarray:
+    existing = pose_data.get("fused", {}).get("poses_3d")
+    if existing is not None:
+        existing = np.asarray(existing, dtype=float)
+        if existing.ndim == 3 and existing.shape[0] >= total_frame_count:
+            return existing[:total_frame_count].copy()
+    return ((left[:total_frame_count] + right[:total_frame_count]) / 2.0).astype(float)
+
+
+def _apply_pose_update(
+    prior: np.ndarray,
+    candidate: np.ndarray,
+    *,
+    mode: str,
+    blend_alpha: float,
+    max_joint_shift_m: float,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    mode = str(mode or "off").lower()
+    prior = np.asarray(prior, dtype=float)
+    candidate = np.asarray(candidate, dtype=float)
+    delta = candidate - prior
+    shift = np.linalg.norm(delta, axis=1)
+    max_shift = float(np.nanmax(shift)) if shift.size else 0.0
+    mean_shift = float(np.nanmean(shift)) if shift.size else 0.0
+
+    if mode == "full":
+        return candidate, {"mode": mode, "mean_shift_m": mean_shift, "max_shift_m": max_shift}
+    if mode == "blend":
+        alpha = float(np.clip(blend_alpha, 0.0, 1.0))
+        bounded_delta = _limit_joint_shift(delta, max_joint_shift_m)
+        updated = prior + alpha * bounded_delta
+        applied_shift = np.linalg.norm(updated - prior, axis=1)
+        return updated, {
+            "mode": mode,
+            "alpha": alpha,
+            "mean_shift_m": mean_shift,
+            "max_shift_m": max_shift,
+            "mean_applied_shift_m": float(np.nanmean(applied_shift)),
+            "max_applied_shift_m": float(np.nanmax(applied_shift)),
+        }
+    return prior, {"mode": "off", "mean_shift_m": mean_shift, "max_shift_m": max_shift}
+
+
+def _limit_joint_shift(delta: np.ndarray, max_joint_shift_m: float) -> np.ndarray:
+    if max_joint_shift_m <= 0:
+        return np.zeros_like(delta)
+    norms = np.linalg.norm(delta, axis=1, keepdims=True)
+    scale = np.minimum(1.0, max_joint_shift_m / np.maximum(norms, 1e-8))
+    return delta * scale
+
+
+def _summarize_pose_updates(stats: list[dict[str, Any]]) -> dict[str, Any]:
+    if not stats:
+        return {"processed_frames": 0}
+    return {
+        "processed_frames": len(stats),
+        "mode": stats[-1].get("mode", "unknown"),
+        "mean_candidate_shift_m": _mean_stat(stats, "mean_shift_m"),
+        "max_candidate_shift_m": _max_stat(stats, "max_shift_m"),
+        "mean_applied_shift_m": _mean_stat(stats, "mean_applied_shift_m"),
+        "max_applied_shift_m": _max_stat(stats, "max_applied_shift_m"),
+    }
+
+
+def _mean_stat(stats: list[dict[str, Any]], key: str) -> float | None:
+    values = [float(item[key]) for item in stats if key in item]
+    if not values:
+        return None
+    return float(np.mean(values))
+
+
+def _max_stat(stats: list[dict[str, Any]], key: str) -> float | None:
+    values = [float(item[key]) for item in stats if key in item]
+    if not values:
+        return None
+    return float(np.max(values))
 
 
 def _should_log_progress(frame_idx: int, frame_count: int, interval: int) -> bool:

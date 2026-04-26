@@ -42,9 +42,18 @@ Y nghia:
 
 - `--sequence RJL`: chay Pose Refinement, Pose Judgement, Learnable SMPLify.
 - `--render-stage R`: video 3D render pose sau stage R, tranh pose sau J/L dang bi giat/meo.
+- `--judgement-pose-update off`: mac dinh hien tai; J van chay va ghi metadata nhung khong ghi de pose 3D tu R.
 - `--render-zoom 1.15`: phong to skeleton 3D trong panel render.
 - `--max-judgement-frames 100`: chi cho J xu ly 100 frame dau.
 - `--opencap-max-frames 100`: chi cho R xu ly 100 frame dau.
+
+Neu muon cho J tac dong nhe vao pose, dung mode blend:
+
+```powershell
+python main.py --no-prompt --sequence RJL --max-judgement-frames 100 --opencap-max-frames 100 --opencap-iterations 1 --judgement-pose-update blend --judgement-blend-alpha 0.2 --judgement-max-joint-shift-m 0.15 --output-dir outputs\test_j_blend_100
+```
+
+Khong khuyen dung `--judgement-pose-update full` cho output hien tai, vi mode nay la cach cu da lam skeleton bi giat/meo.
 
 Output nam trong:
 
@@ -79,4 +88,3 @@ Neu `R` dep nhung `RJ` hong, loi nam o J. Neu `RJ` dep nhung `RJL` hong, loi nam
 - `vendor/learnable-simplify-for-inverse-kinematic-main/...`: cac module cho Learnable SMPLify.
 
 `vendor/` co chua mot so model file lon. Repo da push du nhung lan clone dau tien co the mat thoi gian.
-
