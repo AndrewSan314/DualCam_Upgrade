@@ -4,7 +4,7 @@ from pathlib import Path
 
 import numpy as np
 
-from pose_pipeline.visualization.pose_renderer import render_3d_pose
+from pose_pipeline.visualization.pose_renderer import build_pose_view, render_3d_pose
 
 
 def compose_output_video(
@@ -13,6 +13,7 @@ def compose_output_video(
     pose_3d: np.ndarray,
     joint_names: list[str],
     output_path: str | Path,
+    render_zoom: float = 1.0,
 ) -> Path:
     import cv2
 
@@ -39,6 +40,12 @@ def compose_output_video(
         int(cap_r.get(cv2.CAP_PROP_FRAME_COUNT) or len(pose_3d)),
         len(pose_3d),
     )
+    pose_view = build_pose_view(
+        pose_3d[:frame_count],
+        joint_names,
+        (panel_width, height),
+        zoom=render_zoom,
+    )
     for idx in range(frame_count):
         ok_l, frame_l = cap_l.read()
         ok_r, frame_r = cap_r.read()
@@ -47,7 +54,7 @@ def compose_output_video(
         panels = [
             cv2.resize(frame_l, (panel_width, height)),
             cv2.resize(frame_r, (panel_width, height)),
-            render_3d_pose(pose_3d[idx], joint_names, (panel_width, height)),
+            render_3d_pose(pose_3d[idx], joint_names, (panel_width, height), pose_view),
         ]
         writer.write(np.concatenate(panels, axis=1))
 

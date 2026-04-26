@@ -47,8 +47,9 @@ def main() -> int:
         seq_start = time.perf_counter()
         print(f"\nBắt đầu sequence {sequence}", flush=True)
         current = clone_initial_pose_data(pose_data)
-        current = run_pipeline_sequence(sequence, current, config)
+        current, pose_snapshots = run_pipeline_sequence(sequence, current, config)
         final_pose = select_final_pose(current)
+        render_pose = select_render_pose(final_pose, pose_snapshots, args.render_stage)
 
         video_path = None
         figure_paths = []
@@ -58,9 +59,10 @@ def main() -> int:
             video_path = compose_output_video(
                 current["left"]["video_path"],
                 current["right"]["video_path"],
-                final_pose,
+                render_pose,
                 current["joint_names"],
                 output_dir / "videos" / f"{sequence}_cam_left_right_3D_poses.mp4",
+                render_zoom=float(args.render_zoom),
             )
             print(f"Đã tạo video: {video_path}", flush=True)
         if not args.skip_waveform:
@@ -84,6 +86,7 @@ def main() -> int:
                 "sequence": sequence,
                 "seconds": round(time.perf_counter() - seq_start, 3),
                 "video": str(video_path) if video_path else None,
+                "render_stage": args.render_stage,
                 "figures": [str(path) for path in figure_paths],
                 "benchmark": benchmark_result,
                 "metadata": {
@@ -118,6 +121,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-prompt", action="store_true")
     parser.add_argument("--skip-video", action="store_true")
     parser.add_argument("--skip-waveform", action="store_true")
+    parser.add_argument("--render-zoom", type=float, default=1.15)
+    parser.add_argument("--render-stage", default="final", choices=("final", "input", "R", "J", "L"))
     parser.add_argument("--max-judgement-frames", type=int, default=None)
     parser.add_argument("--judgement-log-interval", type=int, default=10)
     parser.add_argument("--judgement-regularization", action="store_true")
@@ -196,22 +201,33 @@ def ensure_output_dirs(output_dir: Path) -> None:
 
 def run_pipeline_sequence(
     sequence: str, pose_data: dict[str, Any], config: dict[str, Any]
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    snapshots = {"input": select_final_pose(pose_data).copy()}
     for symbol in sequence:
         print(f"  Đang chạy pipeline {symbol}...", flush=True)
         step_start = time.perf_counter()
         pose_data = PIPELINE_MAP[symbol](pose_data, config)
+        snapshots[symbol] = select_final_pose(pose_data).copy()
         print(
             f"  Xong pipeline {symbol} sau {time.perf_counter() - step_start:.2f}s",
             flush=True,
         )
-    return pose_data
+    return pose_data, snapshots
 
 
 def select_final_pose(pose_data: dict[str, Any]):
     if pose_data["fused"]["poses_3d"] is not None:
         return pose_data["fused"]["poses_3d"]
     return (pose_data["left"]["poses_3d"] + pose_data["right"]["poses_3d"]) / 2.0
+
+
+def select_render_pose(final_pose, snapshots: dict[str, Any], render_stage: str):
+    if render_stage == "final":
+        return final_pose
+    if render_stage not in snapshots:
+        available = ", ".join(["final", *snapshots.keys()])
+        raise ValueError(f"Render stage {render_stage!r} is not available. Available: {available}")
+    return snapshots[render_stage]
 
 
 def clone_initial_pose_data(pose_data: dict[str, Any]) -> dict[str, Any]:
