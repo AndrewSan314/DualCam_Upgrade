@@ -1,0 +1,2 @@
+"""Video and figure rendering."""
+

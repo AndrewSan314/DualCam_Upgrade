@@ -1,0 +1,14 @@
+joblib
+kornia
+loguru
+matplotlib
+numpy
+opencv-python
+pandas
+plotly
+python-decouple
+pyyaml
+scipy
+torch
+trimesh
+ffmpeg-python
