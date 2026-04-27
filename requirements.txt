@@ -1,3 +1,6 @@
+easydict
+einops
+ffmpeg-python
 joblib
 kornia
 loguru
@@ -5,10 +8,13 @@ matplotlib
 numpy
 opencv-python
 pandas
+pillow
 plotly
 python-decouple
 pyyaml
+requests
 scipy
+smplx
 torch
+tqdm
 trimesh
-ffmpeg-python
