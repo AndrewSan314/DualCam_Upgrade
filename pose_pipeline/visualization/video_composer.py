@@ -14,6 +14,10 @@ def compose_output_video(
     joint_names: list[str],
     output_path: str | Path,
     render_zoom: float = 1.0,
+    render_view: str = "front",
+    render_yaw_deg: float = 45.0,
+    render_pitch_deg: float = 55.0,
+    render_y_up: bool | None = None,
 ) -> Path:
     import cv2
 
@@ -45,6 +49,10 @@ def compose_output_video(
         joint_names,
         (panel_width, height),
         zoom=render_zoom,
+        mode=render_view,
+        yaw_deg=render_yaw_deg,
+        pitch_deg=render_pitch_deg,
+        y_up=render_y_up,
     )
     for idx in range(frame_count):
         ok_l, frame_l = cap_l.read()

@@ -379,7 +379,9 @@ def _valid_faces(faces, vert_count):
 def _uv_to_grid(uv, uv_min, uv_max, grid_size):
     denom = np.maximum(uv_max - uv_min, 1e-12)
     norm = (uv - uv_min) / denom
-    idx = np.clip((norm * (grid_size - 1)).astype(int), 0, grid_size - 1)
+    scaled = norm * (grid_size - 1)
+    scaled = np.where(np.isfinite(scaled), scaled, 0.0)
+    idx = np.clip(scaled, 0, grid_size - 1).astype(int)
     return idx
 
 

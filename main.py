@@ -11,7 +11,16 @@ from pose_pipeline.benchmark.evaluator import evaluate_benchmark
 from pose_pipeline.config import DEFAULT_INPUT_DIR, DEFAULT_OUTPUT_DIR, SUPPORTED_SEQUENCES
 from pose_pipeline.executor import run_pipeline_sequence as run_state_pipeline_sequence
 from pose_pipeline.io_utils.input_loader import load_inputs
+from pose_pipeline.schema import load_pose_pkl
 from pose_pipeline.state import PipelineState
+from pose_pipeline.visualization.render_alignment import (
+    apply_render_alignment_transform,
+    default_render_alignment_cache_path,
+    estimate_render_alignment_transform,
+    load_render_alignment_transform,
+    save_render_alignment_transform,
+    transform_diagnostics,
+)
 from pose_pipeline.visualization.video_composer import compose_output_video
 from pose_pipeline.visualization.waveform import draw_waveform_analysis
 
@@ -33,6 +42,7 @@ def main() -> int:
         flush=True,
     )
     ensure_output_dirs(output_dir)
+    prepare_default_render_alignment_reference(args, pose_data, input_dir, output_dir, config)
 
     sequence_results = []
     for sequence in sequences:
@@ -52,6 +62,19 @@ def main() -> int:
         pose_snapshots = state.snapshots
         final_pose = select_final_pose(current)
         render_pose = select_render_pose(final_pose, pose_snapshots, args.render_stage)
+        render_alignment = None
+        if not args.skip_video:
+            render_pose, render_alignment = align_render_pose_if_requested(
+                render_pose,
+                final_pose,
+                pose_snapshots,
+                args.render_align_stage,
+                args.render_align_reference,
+                args.render_align_transform,
+                args.render_align_save_transform,
+                args.render_align_cache,
+                getattr(args, "default_render_reference_used", False),
+            )
 
         video_path = None
         figure_paths = []
@@ -65,6 +88,10 @@ def main() -> int:
                 current["joint_names"],
                 output_dir / "videos" / f"{sequence}_cam_left_right_3D_poses.mp4",
                 render_zoom=float(args.render_zoom),
+                render_view=str(args.render_view),
+                render_yaw_deg=float(args.render_yaw_deg),
+                render_pitch_deg=float(args.render_pitch_deg),
+                render_y_up=render_up_axis_to_bool(args.render_up_axis),
             )
             print(f"Đã tạo video: {video_path}", flush=True)
         if not args.skip_waveform:
@@ -89,6 +116,11 @@ def main() -> int:
                 "seconds": round(time.perf_counter() - seq_start, 3),
                 "video": str(video_path) if video_path else None,
                 "render_stage": args.render_stage,
+                "render_view": args.render_view,
+                "render_yaw_deg": args.render_yaw_deg,
+                "render_pitch_deg": args.render_pitch_deg,
+                "render_up_axis": args.render_up_axis,
+                "render_alignment": render_alignment,
                 "figures": [str(path) for path in figure_paths],
                 "benchmark": benchmark_result,
                 "metadata": {
@@ -127,8 +159,53 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-prompt", action="store_true")
     parser.add_argument("--skip-video", action="store_true")
     parser.add_argument("--skip-waveform", action="store_true")
-    parser.add_argument("--render-zoom", type=float, default=1.15)
+    parser.add_argument("--render-zoom", type=float, default=1.25)
+    parser.add_argument("--render-view", default="front", choices=("front", "side", "top", "orbit"))
+    parser.add_argument("--render-yaw-deg", type=float, default=45.0)
+    parser.add_argument("--render-pitch-deg", type=float, default=55.0)
+    parser.add_argument("--render-up-axis", default="auto", choices=("auto", "y_up", "y_down"))
     parser.add_argument("--render-stage", default="final", choices=("final", "input", "R", "J", "L"))
+    parser.add_argument("--render-align-stage", default="none", choices=("none", "input", "R", "J", "L", "final"))
+    parser.add_argument(
+        "--render-align-reference",
+        default=None,
+        help=(
+            "Optional standard pose PKL whose coordinate frame is used only for rendering. "
+            "If omitted, the run-local iter1 reference is generated under the output directory."
+        ),
+    )
+    parser.add_argument(
+        "--render-align-transform",
+        default=None,
+        help=(
+            "JSON or run_log.json containing a fixed render similarity transform. "
+            "If the file does not exist and a render reference/stage is provided, it is created."
+        ),
+    )
+    parser.add_argument(
+        "--render-align-save-transform",
+        default=None,
+        help="Save the estimated render alignment transform to this JSON path.",
+    )
+    parser.add_argument(
+        "--render-align-cache",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "When --render-align-reference is used, cache the estimated transform beside "
+            "that reference and reuse it on later runs."
+        ),
+    )
+    parser.add_argument(
+        "--default-render-align",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Use an iteration-1 R prepass as the default render reference when no "
+            "explicit render alignment option is set. If the reference PKL is missing, "
+            "it is generated once under the output directory and reused."
+        ),
+    )
     parser.add_argument("--max-judgement-frames", type=int, default=None)
     parser.add_argument("--judgement-log-interval", type=int, default=10)
     parser.add_argument(
@@ -209,7 +286,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="auto")
     parser.add_argument("--fallback-refiner", default="smooth", choices=("smooth", "none"))
     parser.add_argument("--smooth-window", type=int, default=3)
-    parser.add_argument("--opencap-iterations", type=int, default=75)
+    parser.add_argument("--opencap-iterations", type=int, default=20)
     parser.add_argument("--opencap-height-m", type=float, default=1.7)
     parser.add_argument("--opencap-mass-kg", type=float, default=70.0)
     parser.add_argument("--opencap-sex", default="m", choices=("m", "f"))
@@ -273,6 +350,136 @@ def ensure_output_dirs(output_dir: Path) -> None:
         (output_dir / child).mkdir(parents=True, exist_ok=True)
 
 
+def prepare_default_render_alignment_reference(
+    args: argparse.Namespace,
+    pose_data: dict[str, Any],
+    input_dir: str,
+    output_dir: Path,
+    config: dict[str, Any],
+) -> None:
+    args.default_render_reference_used = False
+    if not _should_use_default_render_reference(args):
+        return
+
+    reference_path = ensure_iter1_render_reference(pose_data, input_dir, output_dir, config)
+    args.render_align_reference = str(reference_path)
+    args.default_render_reference_used = True
+
+
+def _should_use_default_render_reference(args: argparse.Namespace) -> bool:
+    if args.skip_video or not args.default_render_align:
+        return False
+    if args.render_align_reference or args.render_align_transform:
+        return False
+    return args.render_align_stage == "none"
+
+
+def ensure_iter1_render_reference(
+    pose_data: dict[str, Any],
+    input_dir: str,
+    output_dir: Path,
+    config: dict[str, Any],
+) -> Path:
+    reference_output_dir = iter1_render_reference_output_dir(output_dir)
+    reference_path = iter1_render_reference_path(output_dir)
+    metadata_path = iter1_render_reference_metadata_path(output_dir)
+    expected_metadata = iter1_render_reference_metadata(input_dir, config)
+    if reference_path.exists() and _json_file_matches(metadata_path, expected_metadata):
+        print(f"Render align: dùng iter1 reference có sẵn: {reference_path}", flush=True)
+        return reference_path
+    if reference_path.exists():
+        print(
+            "Render align: iter1 reference cũ không khớp input/config hiện tại, "
+            "sẽ tạo lại.",
+            flush=True,
+        )
+
+    print(
+        "Render align: chưa có iter1 reference, tự chạy prepass R với "
+        f"opencap_iterations=1 tại {reference_output_dir}",
+        flush=True,
+    )
+    ensure_output_dirs(reference_output_dir)
+    cache_path = default_render_alignment_cache_path(reference_path)
+    if cache_path.exists():
+        cache_path.unlink()
+
+    prepass_config = dict(config)
+    prepass_config["output_dir"] = str(reference_output_dir)
+    prepass_config["opencap_iterations"] = 1
+    prepass_config["benchmark"] = None
+    prepass_state = PipelineState.from_pose_data(
+        clone_initial_pose_data(pose_data),
+        input_dir=Path(input_dir).resolve(),
+        output_dir=reference_output_dir,
+        benchmark_path=None,
+    )
+    prepass_state = run_state_pipeline_sequence("R", prepass_state, prepass_config)
+    if prepass_state.unified_pkl != reference_path:
+        raise RuntimeError(
+            "Iter1 render reference was created at an unexpected path: "
+            f"{prepass_state.unified_pkl}; expected {reference_path}"
+        )
+    if not reference_path.exists():
+        raise FileNotFoundError(reference_path)
+    metadata_path.write_text(
+        json.dumps(expected_metadata, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    print(f"Render align: đã tạo iter1 reference: {reference_path}", flush=True)
+    return reference_path
+
+
+def iter1_render_reference_output_dir(output_dir: Path) -> Path:
+    return Path(output_dir).resolve() / "render_reference_iter1"
+
+
+def iter1_render_reference_path(output_dir: Path) -> Path:
+    return iter1_render_reference_output_dir(output_dir) / "intermediate" / "unify_R.pkl"
+
+
+def iter1_render_reference_metadata_path(output_dir: Path) -> Path:
+    return iter1_render_reference_output_dir(output_dir) / "reference_meta.json"
+
+
+def iter1_render_reference_metadata(input_dir: str, config: dict[str, Any]) -> dict[str, Any]:
+    root = Path(input_dir).expanduser().resolve()
+    return {
+        "schema": "pose_pipeline.iter1_render_reference.v1",
+        "input_dir": str(root),
+        "left_pkl": _file_fingerprint(root / "left.pkl"),
+        "right_pkl": _file_fingerprint(root / "right.pkl"),
+        "opencap_iterations": 1,
+        "opencap_max_frames": config.get("opencap_max_frames"),
+        "opencap_sex": config.get("opencap_sex"),
+        "opencap_height_m": config.get("opencap_height_m"),
+        "opencap_mass_kg": config.get("opencap_mass_kg"),
+        "opencap_activity": config.get("opencap_activity"),
+    }
+
+
+def _file_fingerprint(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {"path": str(path), "exists": False}
+    stat = path.stat()
+    return {
+        "path": str(path),
+        "exists": True,
+        "size": int(stat.st_size),
+        "mtime_ns": int(stat.st_mtime_ns),
+    }
+
+
+def _json_file_matches(path: Path, expected: dict[str, Any]) -> bool:
+    if not path.exists():
+        return False
+    try:
+        actual = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return actual == expected
+
+
 def select_final_pose(pose_data: dict[str, Any]):
     if pose_data["fused"]["poses_3d"] is not None:
         return pose_data["fused"]["poses_3d"]
@@ -286,6 +493,90 @@ def select_render_pose(final_pose, snapshots: dict[str, Any], render_stage: str)
         available = ", ".join(["final", *snapshots.keys()])
         raise ValueError(f"Render stage {render_stage!r} is not available. Available: {available}")
     return snapshots[render_stage]
+
+
+def align_render_pose_if_requested(
+    render_pose,
+    final_pose,
+    snapshots: dict[str, Any],
+    align_stage: str,
+    reference_path: str | None,
+    transform_path: str | None,
+    save_transform_path: str | None,
+    use_reference_cache: bool,
+    used_default_reference: bool,
+):
+    load_transform_path, save_target_path = _resolve_render_transform_paths(
+        reference_path,
+        transform_path,
+        save_transform_path,
+        use_reference_cache,
+    )
+    if load_transform_path is not None:
+        transform = load_render_alignment_transform(load_transform_path)
+        aligned = apply_render_alignment_transform(render_pose, transform)
+        diagnostics = transform_diagnostics(transform)
+        diagnostics["source"] = str(load_transform_path.resolve())
+        diagnostics["mode"] = "loaded_fixed_transform"
+        diagnostics["default_reference"] = used_default_reference
+        return aligned, diagnostics
+
+    reference_pose = None
+    source = None
+    if reference_path:
+        reference_pose = load_pose_pkl(Path(reference_path))["poses_3d"]
+        source = str(Path(reference_path).resolve())
+    elif align_stage != "none":
+        reference_pose = final_pose if align_stage == "final" else snapshots.get(align_stage)
+        if reference_pose is None:
+            available = ", ".join(["none", "final", *snapshots.keys()])
+            raise ValueError(
+                f"Render align stage {align_stage!r} is not available. Available: {available}"
+            )
+        source = align_stage
+
+    if reference_pose is None:
+        return render_pose, None
+
+    transform, diagnostics = estimate_render_alignment_transform(render_pose, reference_pose)
+    diagnostics["source"] = source
+    diagnostics["default_reference"] = used_default_reference
+    if transform is None:
+        return render_pose, diagnostics
+
+    if save_target_path is not None:
+        save_path = save_render_alignment_transform(transform, save_target_path, diagnostics)
+        diagnostics["transform_cache"] = str(save_path.resolve())
+
+    aligned = apply_render_alignment_transform(render_pose, transform)
+    return aligned, diagnostics
+
+
+def _resolve_render_transform_paths(
+    reference_path: str | None,
+    transform_path: str | None,
+    save_transform_path: str | None,
+    use_reference_cache: bool,
+) -> tuple[Path | None, Path | None]:
+    reference_cache = (
+        default_render_alignment_cache_path(reference_path)
+        if reference_path and use_reference_cache
+        else None
+    )
+    if transform_path:
+        path = Path(transform_path)
+        return (path if path.exists() else None), (None if path.exists() else path)
+    if reference_cache is not None and reference_cache.exists():
+        return reference_cache, None
+    if save_transform_path:
+        return None, Path(save_transform_path)
+    return None, reference_cache
+
+
+def render_up_axis_to_bool(value: str) -> bool | None:
+    if value == "auto":
+        return None
+    return value == "y_up"
 
 
 def clone_initial_pose_data(pose_data: dict[str, Any]) -> dict[str, Any]:

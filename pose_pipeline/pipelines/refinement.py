@@ -140,7 +140,13 @@ def _run_single_camera_refinement(
     if optimized_pkl and Path(optimized_pkl).exists():
         refined = load_wham_pkl(optimized_pkl)
         _replace_side_pose(side_data, refined)
-        _record_refinement_metadata(side_data, "opencap_optimized", None, payload_summary, output_paths)
+        _record_refinement_metadata(
+            side_data,
+            "opencap_optimized",
+            None,
+            payload_summary,
+            output_paths,
+        )
         print(f"    R: OpenCap camera {side} da xuat optimized pkl.", flush=True)
         return {
             "status": "opencap_optimized",
@@ -322,7 +328,9 @@ def _slice_person(person: dict[str, Any], frame_count: int) -> dict[str, Any]:
 
 def _replace_side_pose(side_data: dict[str, Any], refined: dict[str, Any]) -> None:
     side_data["poses_3d"] = refined["poses_3d"]
-    side_data["poses_2d"] = refined.get("poses_2d")
+    refined_poses_2d = refined.get("poses_2d")
+    if refined_poses_2d is not None:
+        side_data["poses_2d"] = refined_poses_2d
     side_data["confidence"] = refined["confidence"]
     side_data["frame_ids"] = refined["frame_ids"]
     side_data["raw_data"] = refined["raw_data"]

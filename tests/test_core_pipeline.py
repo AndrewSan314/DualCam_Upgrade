@@ -20,6 +20,12 @@ from pose_pipeline.pipelines.learnable_smplify import _update_fused_after_side_r
 from pose_pipeline.schema import load_pose_pkl, save_pose_pkl
 from pose_pipeline.state import PipelineState
 from pose_pipeline.validation import validate_state
+from pose_pipeline.visualization.render_alignment import (
+    align_pose_to_render_reference,
+    apply_render_alignment_transform,
+    load_render_alignment_transform,
+    save_render_alignment_transform,
+)
 from pose_pipeline.visualization.waveform import angle_between
 
 
@@ -91,6 +97,48 @@ class CorePipelineTests(unittest.TestCase):
 
         self.assertIn("scale", diagnostics)
         np.testing.assert_allclose(aligned, base, atol=1e-5)
+
+    def test_render_alignment_returns_aligned_copy_only(self) -> None:
+        base = np.asarray(
+            [
+                [[0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.5, 0.0, 0.2], [-0.5, 0.0, -0.1]],
+                [[0.1, 0.0, 0.0], [0.1, 1.0, 0.0], [0.6, 0.0, 0.2], [-0.4, 0.0, -0.1]],
+            ],
+            dtype=np.float32,
+        )
+        theta = np.radians(25.0)
+        rotation_y = np.asarray(
+            [
+                [np.cos(theta), 0.0, np.sin(theta)],
+                [0.0, 1.0, 0.0],
+                [-np.sin(theta), 0.0, np.cos(theta)],
+            ],
+            dtype=np.float32,
+        )
+        pose = 1.2 * (base @ rotation_y.T) + np.asarray([2.0, -1.0, 0.5])
+        original = pose.copy()
+
+        aligned, diagnostics = align_pose_to_render_reference(pose, base)
+
+        self.assertIn("scale", diagnostics)
+        np.testing.assert_allclose(aligned, base, atol=1e-5)
+        np.testing.assert_allclose(pose, original, atol=0.0)
+
+    def test_render_alignment_transform_roundtrip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "render_transform.json"
+            transform = {
+                "scale": 2.0,
+                "rotation": np.eye(3),
+                "translation": np.asarray([1.0, -2.0, 3.0]),
+            }
+            pose = np.asarray([[[1.0, 2.0, 3.0]]], dtype=np.float32)
+
+            save_render_alignment_transform(transform, path, {"source": "test"})
+            loaded = load_render_alignment_transform(path)
+            aligned = apply_render_alignment_transform(pose, loaded)
+
+            np.testing.assert_allclose(aligned, [[[3.0, 2.0, 9.0]]], atol=1e-6)
 
     def test_build_view_weights_shapes(self) -> None:
         base = np.zeros((3, 2, 3), dtype=np.float32)

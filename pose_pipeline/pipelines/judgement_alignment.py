@@ -49,13 +49,26 @@ def sequence_scale_to_base(
 def align_sequence_umeyama(
     candidate: np.ndarray, base: np.ndarray
 ) -> tuple[np.ndarray, dict[str, Any]]:
+    transform, diagnostics = estimate_sequence_umeyama(candidate, base)
+    if transform is None:
+        if diagnostics.get("fallback") == "root_scale":
+            return sequence_scale_to_base(candidate, base), diagnostics
+        return np.asarray(base, dtype=np.float32).copy(), diagnostics
+
+    aligned = apply_similarity_transform(candidate, transform)
+    return aligned.astype(np.float32), diagnostics
+
+
+def estimate_sequence_umeyama(
+    candidate: np.ndarray, base: np.ndarray
+) -> tuple[dict[str, np.ndarray | float] | None, dict[str, Any]]:
     source = np.asarray(candidate, dtype=np.float64).reshape(-1, 3)
     target = np.asarray(base, dtype=np.float64).reshape(-1, 3)
     finite = np.isfinite(source).all(axis=1) & np.isfinite(target).all(axis=1)
     source = source[finite]
     target = target[finite]
     if source.shape[0] < 4:
-        return sequence_scale_to_base(candidate, base), {"fallback": "root_scale"}
+        return None, {"fallback": "root_scale"}
 
     src_mean = source.mean(axis=0)
     tgt_mean = target.mean(axis=0)
@@ -63,7 +76,7 @@ def align_sequence_umeyama(
     tgt_centered = target - tgt_mean
     variance = np.mean(np.sum(src_centered**2, axis=1))
     if variance < 1e-12:
-        return np.asarray(base, dtype=np.float32).copy(), {"fallback": "base_zero_variance"}
+        return None, {"fallback": "base_zero_variance"}
 
     covariance = (src_centered.T @ tgt_centered) / source.shape[0]
     u, singular_values, vt = np.linalg.svd(covariance)
@@ -74,12 +87,23 @@ def align_sequence_umeyama(
     scale = float(np.sum(singular_values) / variance)
     translation = tgt_mean - scale * (src_mean @ rotation.T)
 
-    aligned = scale * (np.asarray(candidate, dtype=np.float64) @ rotation.T) + translation
-    return aligned.astype(np.float32), {
+    return {"scale": scale, "rotation": rotation, "translation": translation}, {
         "scale": scale,
+        "rotation": rotation.astype(float).tolist(),
         "translation": translation.astype(float).tolist(),
         "valid_points": int(source.shape[0]),
     }
+
+
+def apply_similarity_transform(
+    points: np.ndarray,
+    transform: dict[str, np.ndarray | float],
+) -> np.ndarray:
+    arr = np.asarray(points, dtype=np.float64)
+    rotation = np.asarray(transform["rotation"], dtype=np.float64)
+    translation = np.asarray(transform["translation"], dtype=np.float64)
+    scale = float(transform["scale"])
+    return scale * (arr @ rotation.T) + translation
 
 
 def _mean_norm(values: np.ndarray) -> float:

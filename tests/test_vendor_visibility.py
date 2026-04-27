@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import unittest
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -167,6 +168,33 @@ class VendorVisibilityTests(unittest.TestCase):
         )
 
         self.assertFalse(visibility["joint"])
+
+    def test_visibility_ignores_invalid_vertices_without_runtime_warning(self) -> None:
+        vendor = _load_vendor_main()
+        verts = np.asarray(
+            [
+                [-0.2, -0.2, 2.0],
+                [0.2, -0.2, 2.0],
+                [0.0, 0.2, 2.0],
+                [np.nan, 0.0, 1.0],
+                [0.0, 0.0, -1.0],
+            ],
+            dtype=float,
+        )
+        faces = np.asarray([[0, 1, 2], [0, 1, 3], [0, 2, 4]], dtype=int)
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", RuntimeWarning)
+            visibility = vendor.compute_visibility_from_mesh_vertices(
+                {"front": [0.0, 0.0, 1.8], "back": [0.0, 0.0, 2.2]},
+                verts,
+                faces=faces,
+                grid_size=64,
+                occlusion_tau=0.02,
+            )
+
+        self.assertTrue(visibility["front"])
+        self.assertFalse(visibility["back"])
 
 
 if __name__ == "__main__":
