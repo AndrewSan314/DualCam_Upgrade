@@ -12,7 +12,41 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from pose_pipeline.io_utils.pkl_loader import load_wham_pkl
+from pose_pipeline.naming import make_unified_output_path
+from pose_pipeline.schema import pose_data_view_to_standard_schema, save_pose_pkl
+from pose_pipeline.state import PipelineState
 from pose_pipeline.vendor_paths import OPENCAP_ROOT
+
+
+def run_R(state: PipelineState, config: dict[str, Any]) -> PipelineState:
+    if state.pose_data is None:
+        raise ValueError("PipelineState.pose_data is required for R")
+    if state.output_dir is None:
+        raise ValueError("PipelineState.output_dir is required for R")
+    if state.mode not in {"dual", "unified"}:
+        raise ValueError(f"Unsupported state mode for R: {state.mode}")
+
+    new_history = state.history + ["R"]
+    if state.mode == "unified":
+        _mirror_unified_pose_to_dual_inputs(state.pose_data)
+
+    state.pose_data = run_pose_refinement(state.pose_data, config)
+    output_path = make_unified_output_path(state.output_dir, new_history)
+    save_pose_pkl(
+        pose_data_view_to_standard_schema(
+            state.pose_data,
+            "unified",
+            new_history,
+            created_by="pose_pipeline.pipelines.refinement.run_R",
+        ),
+        output_path,
+    )
+
+    state.mode = "unified"
+    state.unified_pkl = output_path
+    state.history = new_history
+    state.artifacts["".join(new_history)] = output_path
+    return state
 
 
 def run_pose_refinement(pose_data: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
@@ -35,6 +69,18 @@ def run_pose_refinement(pose_data: dict[str, Any], config: dict[str, Any]) -> di
     }
     pose_data["logs"].append("R: ran opencap-monocular-main optimization.run_optimization for left/right")
     return pose_data
+
+
+def _mirror_unified_pose_to_dual_inputs(pose_data: dict[str, Any]) -> None:
+    fused = pose_data.get("fused", {})
+    poses_3d = fused.get("poses_3d")
+    if poses_3d is None:
+        return
+    confidence = fused.get("confidence")
+    for side in ("left", "right"):
+        pose_data[side]["poses_3d"] = np.asarray(poses_3d, dtype=np.float32).copy()
+        if confidence is not None:
+            pose_data[side]["confidence"] = np.asarray(confidence, dtype=np.float32).copy()
 
 
 def _run_single_camera_refinement(

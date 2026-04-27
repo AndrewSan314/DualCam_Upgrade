@@ -9,19 +9,11 @@ from typing import Any
 
 from pose_pipeline.benchmark.evaluator import evaluate_benchmark
 from pose_pipeline.config import DEFAULT_INPUT_DIR, DEFAULT_OUTPUT_DIR, SUPPORTED_SEQUENCES
+from pose_pipeline.executor import run_pipeline_sequence as run_state_pipeline_sequence
 from pose_pipeline.io_utils.input_loader import load_inputs
-from pose_pipeline.pipelines.judgement import run_pose_judgement
-from pose_pipeline.pipelines.learnable_smplify import run_learnable_smplify
-from pose_pipeline.pipelines.refinement import run_pose_refinement
+from pose_pipeline.state import PipelineState
 from pose_pipeline.visualization.video_composer import compose_output_video
 from pose_pipeline.visualization.waveform import draw_waveform_analysis
-
-
-PIPELINE_MAP = {
-    "R": run_pose_refinement,
-    "J": run_pose_judgement,
-    "L": run_learnable_smplify,
-}
 
 
 def main() -> int:
@@ -47,7 +39,17 @@ def main() -> int:
         seq_start = time.perf_counter()
         print(f"\nBắt đầu sequence {sequence}", flush=True)
         current = clone_initial_pose_data(pose_data)
-        current, pose_snapshots = run_pipeline_sequence(sequence, current, config)
+        state = PipelineState.from_pose_data(
+            current,
+            input_dir=Path(input_dir).resolve(),
+            output_dir=output_dir,
+            benchmark_path=Path(benchmark_path).resolve() if benchmark_path else None,
+        )
+        state = run_state_pipeline_sequence(sequence, state, config)
+        current = state.pose_data
+        if current is None:
+            raise ValueError("Pipeline executor finished without pose_data")
+        pose_snapshots = state.snapshots
         final_pose = select_final_pose(current)
         render_pose = select_render_pose(final_pose, pose_snapshots, args.render_stage)
 
@@ -93,6 +95,10 @@ def main() -> int:
                     "left": current["left"].get("metadata", {}),
                     "right": current["right"].get("metadata", {}),
                     "fused": current["fused"].get("metadata", {}),
+                    "state_mode": state.mode,
+                    "history": state.history,
+                    "artifacts": {key: str(path) for key, path in state.artifacts.items()},
+                    "transitions": state.metadata.get("transitions", []),
                 },
                 "logs": current["logs"],
             }
@@ -125,16 +131,81 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--render-stage", default="final", choices=("final", "input", "R", "J", "L"))
     parser.add_argument("--max-judgement-frames", type=int, default=None)
     parser.add_argument("--judgement-log-interval", type=int, default=10)
+    parser.add_argument(
+        "--judgement-mode",
+        default="safe_fusion",
+        choices=("metadata_only", "safe_fusion", "temporal_multiview_optimize", "full_legacy"),
+    )
+    parser.add_argument(
+        "--judgement-coordinate-alignment",
+        default="sequence_umeyama",
+        choices=("none", "root_scale", "sequence_umeyama"),
+    )
+    parser.add_argument("--judgement-window-size", type=int, default=32)
+    parser.add_argument("--judgement-stride", type=int, default=8)
+    parser.add_argument("--judgement-iters", type=int, default=80)
+    parser.add_argument("--judgement-lr", type=float, default=0.03)
+    parser.add_argument("--judgement-lambda-data", type=float, default=1.0)
+    parser.add_argument("--judgement-lambda-prior", type=float, default=0.4)
+    parser.add_argument("--judgement-lambda-bone", type=float, default=8.0)
+    parser.add_argument("--judgement-lambda-temp", type=float, default=0.3)
+    parser.add_argument("--judgement-lambda-acc", type=float, default=1.5)
+    parser.add_argument("--judgement-lambda-floor", type=float, default=3.0)
+    parser.add_argument("--judgement-lambda-contact", type=float, default=2.0)
+    parser.add_argument("--judgement-camera-disagreement-threshold-m", type=float, default=0.25)
+    parser.add_argument("--judgement-min-base-prior-weight", type=float, default=0.2)
+    parser.add_argument("--judgement-max-base-prior-weight", type=float, default=1.0)
+    parser.add_argument("--judgement-safe-max-joint-shift-m", type=float, default=0.12)
+    parser.add_argument("--judgement-temporal-smoothing-window", type=int, default=5)
+    parser.add_argument("--judgement-temporal-smoothing-alpha", type=float, default=0.65)
+    parser.add_argument(
+        "--judgement-temporal-smoothing-target",
+        default="correction",
+        choices=("correction", "pose"),
+    )
+    parser.add_argument("--judgement-temporal-median-window", type=int, default=3)
+    parser.add_argument("--judgement-weight-smoothing-window", type=int, default=5)
+    parser.add_argument("--judgement-weight-smoothing-alpha", type=float, default=0.65)
+    parser.add_argument("--judgement-spike-repair", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--judgement-spike-acceleration-ratio-vs-base", type=float, default=1.8)
+    parser.add_argument("--judgement-spike-acceleration-m-per-frame2", type=float, default=0.12)
+    parser.add_argument("--judgement-spike-repair-alpha", type=float, default=0.85)
+    parser.add_argument("--judgement-spike-repair-passes", type=int, default=2)
+    parser.add_argument("--judgement-floor-axis", type=int, default=2)
+    parser.add_argument("--judgement-floor-value", type=float, default=0.0)
+    parser.add_argument("--judgement-max-bone-deviation-ratio", type=float, default=0.20)
+    parser.add_argument("--judgement-max-joint-velocity-m-per-frame", type=float, default=0.35)
+    parser.add_argument("--judgement-max-joint-acceleration-m-per-frame2", type=float, default=0.45)
+    parser.add_argument("--judgement-max-mean-acceleration-ratio-vs-base", type=float, default=1.35)
+    parser.add_argument("--judgement-max-acceleration-ratio-vs-base", type=float, default=2.25)
     parser.add_argument("--judgement-pose-update", default="off", choices=("off", "blend", "full"))
+    parser.add_argument(
+        "--judgement-output-mode-when-dual",
+        default="auto",
+        choices=("auto", "dual", "unified"),
+        help="When J receives dual left/right input, keep dual if R remains by default.",
+    )
     parser.add_argument("--judgement-blend-alpha", type=float, default=0.2)
     parser.add_argument("--judgement-max-joint-shift-m", type=float, default=0.15)
-    parser.add_argument("--judgement-regularization", action="store_true")
-    parser.add_argument("--judgement-regularization-lambda", type=float, default=1.0)
+    parser.add_argument("--judgement-regularization", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--judgement-regularization-lambda", type=float, default=10.0)
+    parser.add_argument("--judgement-vendor-max-joint-move-m", type=float, default=0.10)
+    parser.add_argument(
+        "--judgement-vendor-reject-excessive-displacement",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--soft-tail-temperature", type=float, default=0.05)
     parser.add_argument("--soft-tail-weight", type=float, default=1.0)
     parser.add_argument("--learnable-smplify-src", default=None)
     parser.add_argument("--learnable-checkpoint", default=None)
     parser.add_argument("--smpl-model-dir", default=None)
+    parser.add_argument(
+        "--learnable-fused-update",
+        default="auto",
+        choices=("auto", "average", "judgement_weights", "off"),
+        help="How L updates fused output after refining left/right raw SMPL.",
+    )
     parser.add_argument("--device", default="auto")
     parser.add_argument("--fallback-refiner", default="smooth", choices=("smooth", "none"))
     parser.add_argument("--smooth-window", type=int, default=3)
@@ -198,24 +269,8 @@ def resolve_console_args(args: argparse.Namespace) -> tuple[str, str | None, lis
 
 
 def ensure_output_dirs(output_dir: Path) -> None:
-    for child in ("videos", "figures", "logs"):
+    for child in ("intermediate", "videos", "figures", "logs"):
         (output_dir / child).mkdir(parents=True, exist_ok=True)
-
-
-def run_pipeline_sequence(
-    sequence: str, pose_data: dict[str, Any], config: dict[str, Any]
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    snapshots = {"input": select_final_pose(pose_data).copy()}
-    for symbol in sequence:
-        print(f"  Đang chạy pipeline {symbol}...", flush=True)
-        step_start = time.perf_counter()
-        pose_data = PIPELINE_MAP[symbol](pose_data, config)
-        snapshots[symbol] = select_final_pose(pose_data).copy()
-        print(
-            f"  Xong pipeline {symbol} sau {time.perf_counter() - step_start:.2f}s",
-            flush=True,
-        )
-    return pose_data, snapshots
 
 
 def select_final_pose(pose_data: dict[str, Any]):

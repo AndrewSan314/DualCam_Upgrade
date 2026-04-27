@@ -101,6 +101,8 @@ RANSAC_MAX_COMBOS = 500
 DIST_CONF_REF = 2.0  # mốc khoảng cách cho confidence theo distance
 SOFT_TAIL_TEMPERATURE = 0.05  # m, càng nhỏ càng tập trung vào diff lớn
 SOFT_TAIL_WEIGHT = 1.0
+DEFAULT_REGULARIZATION_LAMBDA = 10.0
+MAX_JOINT_MOVE_M = 0.10
 
 
 def _as_xyz(point):
@@ -174,21 +176,33 @@ def compute_visibility_from_mesh_vertices(
     joints,
     verts,
     *,
+    faces=None,
+    camera=None,
+    image_size=None,
     grid_size=160,
     occlusion_tau=0.02,
 ):
     """
-    Ước lượng visibility của joint bằng depth-grid tạo từ vertices của mesh.
+    Ước lượng visibility bằng camera-space z-buffer.
 
-    Cách làm (xấp xỉ nhanh):
-    - Raster vertices vào lưới 2D (theo trục x,y của hệ đang dùng).
-    - Tại mỗi ô lưới, giữ depth gần nhất (z nhỏ hơn theo |z|).
-    - Joint được coi là "thấy được" nếu depth joint không nằm sau bề mặt
-      quá ngưỡng occlusion_tau.
+    Cách làm:
+    - Đưa vertices/joints về camera coordinates nếu có extrinsics.
+    - Project bằng pinhole camera:
+      * nếu có intrinsics K: u = fx*x/z + cx, v = fy*y/z + cy;
+      * nếu chưa có K: dùng normalized image plane u=x/z, v=y/z.
+    - Raster triangle faces nếu có; nếu không có faces thì vertex-splat fallback.
+    - Depth là z theo trục nhìn camera, không dùng abs(z).
+    - Joint được coi là khuất nếu depth joint nằm sau z-buffer quá
+      occlusion_tau tại pixel/ray tương ứng.
 
     Input:
     - joints: map joint_name -> [x,y,z].
     - verts: ndarray (N,3) của mesh tại frame đang xét.
+    - faces: optional ndarray (F,3) indices. Nếu có thì raster tam giác.
+    - camera: optional dict chứa một trong các dạng:
+        K/intrinsics/camera_matrix: 3x3 intrinsics;
+        R + t hoặc extrinsics/world_to_camera: world->camera transform.
+    - image_size: optional (width,height). Nếu có K thì dùng để map pixel.
     - grid_size: độ phân giải lưới depth.
     - occlusion_tau: biên dung sai depth (m).
 
@@ -198,36 +212,60 @@ def compute_visibility_from_mesh_vertices(
     verts = np.asarray(verts, dtype=float)
     if verts.ndim != 2 or verts.shape[1] != 3:
         raise ValueError(f"Expected verts shape (N,3), got {verts.shape}")
+    if grid_size < 8:
+        raise ValueError("grid_size must be at least 8")
 
-    xy = verts[:, :2]
-    z_abs = np.abs(verts[:, 2])
+    camera = camera or {}
+    verts_cam = _world_to_camera_points(verts, camera)
+    vert_uv, vert_depth, projection = _project_camera_points(
+        verts_cam,
+        camera=camera,
+        image_size=image_size,
+    )
+    valid_verts = np.isfinite(vert_uv).all(axis=1) & np.isfinite(vert_depth) & (vert_depth > 1e-6)
+    if not np.any(valid_verts):
+        # Không có surface hợp lệ theo camera model: đừng tạo mask sai.
+        return {name: True for name in joints}
 
-    # Dùng percentile để giảm ảnh hưởng outlier ở biên mesh.
-    x_min, y_min = np.percentile(xy, 1, axis=0)
-    x_max, y_max = np.percentile(xy, 99, axis=0)
-    if x_max <= x_min:
-        x_max = x_min + 1e-6
-    if y_max <= y_min:
-        y_max = y_min + 1e-6
-
-    # Depth grid khởi tạo vô cùng: chưa có bề mặt nào đi qua.
+    uv_min, uv_max = _projection_bounds(vert_uv[valid_verts], projection, image_size)
     depth_grid = np.full((grid_size, grid_size), np.inf, dtype=float)
 
-    x_norm = (xy[:, 0] - x_min) / (x_max - x_min)
-    y_norm = (xy[:, 1] - y_min) / (y_max - y_min)
-    x_idx = np.clip((x_norm * (grid_size - 1)).astype(int), 0, grid_size - 1)
-    y_idx = np.clip((y_norm * (grid_size - 1)).astype(int), 0, grid_size - 1)
-
-    # Z-buffer đơn giản: giữ depth gần nhất ở mỗi cell.
-    for xi, yi, zi in zip(x_idx, y_idx, z_abs):
-        if zi < depth_grid[yi, xi]:
-            depth_grid[yi, xi] = zi
+    faces_arr = _valid_faces(faces, len(verts)) if faces is not None else None
+    if faces_arr is not None and len(faces_arr):
+        _rasterize_faces_to_depth_grid(
+            depth_grid,
+            vert_uv,
+            vert_depth,
+            faces_arr,
+            valid_verts,
+            uv_min,
+            uv_max,
+        )
+    else:
+        _splat_vertices_to_depth_grid(
+            depth_grid,
+            vert_uv[valid_verts],
+            vert_depth[valid_verts],
+            uv_min,
+            uv_max,
+        )
 
     visibility = {}
     for name, pos in joints.items():
-        p = _as_xyz(pos)
-        xn = (p[0] - x_min) / (x_max - x_min)
-        yn = (p[1] - y_min) / (y_max - y_min)
+        p_cam = _world_to_camera_points(_as_xyz(pos)[None, :], camera)[0]
+        uv, depth, _ = _project_camera_points(
+            p_cam[None, :],
+            camera=camera,
+            image_size=image_size,
+        )
+        uv = uv[0]
+        z_joint = float(depth[0])
+        if not np.isfinite(uv).all() or not np.isfinite(z_joint) or z_joint <= 1e-6:
+            visibility[name] = True
+            continue
+
+        xn = (uv[0] - uv_min[0]) / max(float(uv_max[0] - uv_min[0]), 1e-12)
+        yn = (uv[1] - uv_min[1]) / max(float(uv_max[1] - uv_min[1]), 1e-12)
 
         # Joint nằm ngoài bbox mesh => coi như không bị mesh che.
         if xn < 0.0 or xn > 1.0 or yn < 0.0 or yn > 1.0:
@@ -242,11 +280,169 @@ def compute_visibility_from_mesh_vertices(
             visibility[name] = True
             continue
 
-        z_joint = abs(float(p[2]))
-        # Nếu joint nằm sau bề mặt quá ngưỡng -> bị khuất.
+        # Nếu joint nằm sau bề mặt theo ray camera quá ngưỡng -> bị khuất.
         visibility[name] = z_joint <= (z_surface + occlusion_tau)
 
     return visibility
+
+
+def _camera_intrinsics(camera):
+    for key in ("K", "intrinsics", "camera_matrix"):
+        if key in camera and camera[key] is not None:
+            k = np.asarray(camera[key], dtype=float)
+            if k.shape == (3, 3):
+                return k
+    return None
+
+
+def _world_to_camera_points(points, camera):
+    pts = np.asarray(points, dtype=float)
+    if pts.ndim != 2 or pts.shape[1] != 3:
+        raise ValueError(f"Expected points shape (N,3), got {pts.shape}")
+
+    for key in ("world_to_camera", "extrinsics", "T_wc"):
+        if key in camera and camera[key] is not None:
+            mat = np.asarray(camera[key], dtype=float)
+            if mat.shape == (4, 4):
+                homog = np.concatenate([pts, np.ones((len(pts), 1))], axis=1)
+                return (homog @ mat.T)[:, :3]
+            if mat.shape == (3, 4):
+                homog = np.concatenate([pts, np.ones((len(pts), 1))], axis=1)
+                return homog @ mat.T
+
+    r = camera.get("R")
+    t = camera.get("t", camera.get("T"))
+    if r is not None:
+        r = np.asarray(r, dtype=float)
+        if r.shape != (3, 3):
+            raise ValueError(f"Expected camera R shape (3,3), got {r.shape}")
+        t = np.zeros(3, dtype=float) if t is None else np.asarray(t, dtype=float).reshape(3)
+        return (r @ pts.T).T + t
+
+    return pts.copy()
+
+
+def _project_camera_points(points_cam, *, camera, image_size=None):
+    pts = np.asarray(points_cam, dtype=float)
+    z = pts[:, 2].astype(float)
+    uv = np.full((len(pts), 2), np.nan, dtype=float)
+    valid = np.isfinite(pts).all(axis=1) & (z > 1e-6)
+    if not np.any(valid):
+        return uv, z, "invalid"
+
+    k = _camera_intrinsics(camera)
+    if k is not None:
+        x = pts[valid, 0] / z[valid]
+        y = pts[valid, 1] / z[valid]
+        uv[valid, 0] = k[0, 0] * x + k[0, 2]
+        uv[valid, 1] = k[1, 1] * y + k[1, 2]
+        return uv, z, "pixel"
+
+    # Normalized pinhole plane. Đây vẫn là camera projection đúng hơn nhiều so
+    # với dùng trực tiếp x,y 3D, vì mọi điểm cùng ray có cùng x/z,y/z.
+    uv[valid, 0] = pts[valid, 0] / z[valid]
+    uv[valid, 1] = pts[valid, 1] / z[valid]
+    return uv, z, "normalized"
+
+
+def _projection_bounds(uv, projection, image_size):
+    if projection == "pixel" and image_size is not None:
+        width, height = _parse_image_size(image_size)
+        if width > 0 and height > 0:
+            return np.asarray([0.0, 0.0]), np.asarray([float(width - 1), float(height - 1)])
+
+    uv_min = np.percentile(uv, 1, axis=0)
+    uv_max = np.percentile(uv, 99, axis=0)
+    span = np.maximum(uv_max - uv_min, 1e-6)
+    return uv_min, uv_min + span
+
+
+def _parse_image_size(image_size):
+    if isinstance(image_size, dict):
+        width = image_size.get("width", image_size.get("w", 0))
+        height = image_size.get("height", image_size.get("h", 0))
+        return int(width), int(height)
+    values = list(image_size)
+    if len(values) != 2:
+        return 0, 0
+    return int(values[0]), int(values[1])
+
+
+def _valid_faces(faces, vert_count):
+    arr = np.asarray(faces, dtype=int)
+    if arr.ndim != 2 or arr.shape[1] != 3:
+        raise ValueError(f"Expected faces shape (F,3), got {arr.shape}")
+    valid = np.all((arr >= 0) & (arr < vert_count), axis=1)
+    return arr[valid]
+
+
+def _uv_to_grid(uv, uv_min, uv_max, grid_size):
+    denom = np.maximum(uv_max - uv_min, 1e-12)
+    norm = (uv - uv_min) / denom
+    idx = np.clip((norm * (grid_size - 1)).astype(int), 0, grid_size - 1)
+    return idx
+
+
+def _splat_vertices_to_depth_grid(depth_grid, uv, depth, uv_min, uv_max):
+    grid_size = depth_grid.shape[0]
+    idx = _uv_to_grid(uv, uv_min, uv_max, grid_size)
+    for (xi, yi), zi in zip(idx, depth):
+        if zi < depth_grid[yi, xi]:
+            depth_grid[yi, xi] = zi
+
+
+def _rasterize_faces_to_depth_grid(depth_grid, uv, depth, faces, valid_verts, uv_min, uv_max):
+    grid_size = depth_grid.shape[0]
+    grid_xy = _uv_to_grid(uv, uv_min, uv_max, grid_size).astype(float)
+    for face in faces:
+        if not np.all(valid_verts[face]):
+            continue
+        tri = grid_xy[face]
+        tri_depth = depth[face]
+        x0 = max(int(np.floor(np.min(tri[:, 0]))), 0)
+        x1 = min(int(np.ceil(np.max(tri[:, 0]))), grid_size - 1)
+        y0 = max(int(np.floor(np.min(tri[:, 1]))), 0)
+        y1 = min(int(np.ceil(np.max(tri[:, 1]))), grid_size - 1)
+        if x1 < x0 or y1 < y0:
+            continue
+
+        denom = _triangle_barycentric_denominator(tri)
+        if abs(denom) < 1e-12:
+            continue
+        for yi in range(y0, y1 + 1):
+            for xi in range(x0, x1 + 1):
+                bary = _triangle_barycentric(np.asarray([xi + 0.5, yi + 0.5]), tri, denom)
+                if np.min(bary) < -1e-6:
+                    continue
+                z = float(np.dot(bary, tri_depth))
+                if z < depth_grid[yi, xi]:
+                    depth_grid[yi, xi] = z
+
+
+def _triangle_barycentric_denominator(tri):
+    a, b, c = tri
+    return (b[1] - c[1]) * (a[0] - c[0]) + (c[0] - b[0]) * (a[1] - c[1])
+
+
+def _triangle_barycentric(point, tri, denom):
+    a, b, c = tri
+    w0 = ((b[1] - c[1]) * (point[0] - c[0]) + (c[0] - b[0]) * (point[1] - c[1])) / denom
+    w1 = ((c[1] - a[1]) * (point[0] - c[0]) + (a[0] - c[0]) * (point[1] - c[1])) / denom
+    return np.asarray([w0, w1, 1.0 - w0 - w1], dtype=float)
+
+
+def _mesh_visibility_payload(value):
+    if isinstance(value, dict):
+        vertices = value.get("vertices", value.get("verts"))
+        if vertices is None:
+            raise ValueError("Mesh payload must contain vertices or verts")
+        return {
+            "vertices": vertices,
+            "faces": value.get("faces"),
+            "camera": value.get("camera"),
+            "image_size": value.get("image_size"),
+        }
+    return {"vertices": value, "faces": None, "camera": None, "image_size": None}
 
 
 def _to_arrays(cam1, cam2, names):
@@ -569,8 +765,8 @@ def optimize_f_points(
     vis1=None,
     vis2=None,
     occluded_factor=0.25,
-    regularization=False,
-    regularization_lambda=1.0,
+    regularization=True,
+    regularization_lambda=DEFAULT_REGULARIZATION_LAMBDA,
     soft_tail_temperature=SOFT_TAIL_TEMPERATURE,
     soft_tail_weight=SOFT_TAIL_WEIGHT,
 ):
@@ -587,7 +783,8 @@ def optimize_f_points(
 
     Output:
     - Pose đã tối ưu cho camera1/camera2.
-    - Kết quả solver (hoặc None nếu F rỗng).
+    - Kết quả solver (hoặc None nếu F rỗng). Nếu solver fail, trả lại pose
+      đầu vào và res.success=False để caller fallback an toàn.
     """
     cam1 = {k: _as_xyz(v) for k, v in data["camera1"].items()}
     cam2 = {k: _as_xyz(v) for k, v in data["camera2"].items()}
@@ -693,7 +890,7 @@ def optimize_f_points(
         options={"maxiter": 1000},
     )
     if not res.success:
-        raise RuntimeError(f"Optimization failed: {res.message}")
+        return {"camera1": cam1, "camera2": cam2}, res
 
     p1_opt = dict(cam1)
     p2_opt = dict(cam2)
@@ -704,6 +901,32 @@ def optimize_f_points(
     return {"camera1": p1_opt, "camera2": p2_opt}, res
 
 
+def compute_displacement_report(before, after, joint_names):
+    """
+    Tính độ dịch chuyển per-joint giữa pose trước/sau tối ưu.
+
+    Output:
+    - dict camera -> joint -> displacement_m.
+    """
+    report = {}
+    for cam in ("camera1", "camera2"):
+        report[cam] = {}
+        for name in joint_names:
+            if name not in before[cam] or name not in after[cam]:
+                continue
+            report[cam][name] = float(
+                np.linalg.norm(_as_xyz(after[cam][name]) - _as_xyz(before[cam][name]))
+            )
+    return report
+
+
+def max_displacement_value(displacement_report):
+    values = []
+    for per_cam in displacement_report.values():
+        values.extend(float(value) for value in per_cam.values())
+    return float(max(values)) if values else 0.0
+
+
 def run_phase3_pipeline(
     data_in,
     verts_by_cam,
@@ -712,10 +935,12 @@ def run_phase3_pipeline(
     occlusion_tau,
     visibility_override=None,
     joint_distance_table=None,
-    regularization=False,
-    regularization_lambda=1.0,
+    regularization=True,
+    regularization_lambda=DEFAULT_REGULARIZATION_LAMBDA,
     soft_tail_temperature=SOFT_TAIL_TEMPERATURE,
     soft_tail_weight=SOFT_TAIL_WEIGHT,
+    max_joint_move_m=MAX_JOINT_MOVE_M,
+    reject_excessive_displacement=True,
 ):
     """
     Chạy toàn bộ workflow phase 3 cho một cặp pose 3D (1 frame):
@@ -725,6 +950,7 @@ def run_phase3_pipeline(
     """
     cam1 = {k: _as_xyz(v) for k, v in data_in["camera1"].items()}
     cam2 = {k: _as_xyz(v) for k, v in data_in["camera2"].items()}
+    warnings = []
 
     # P: tập joint chung giữa 2 camera.
     names = sorted(set(cam1.keys()) & set(cam2.keys()))
@@ -750,24 +976,42 @@ def run_phase3_pipeline(
     # 2) mesh-based occlusion nếu có verts,
     # 3) mặc định mọi điểm đều visible.
     if visibility_override is not None:
+        warnings.append("Using visibility_override; not real mesh/camera occlusion")
         vis1_raw = visibility_override.get("camera1", {})
         vis2_raw = visibility_override.get("camera2", {})
         vis1 = {n: bool(vis1_raw.get(n, True)) for n in names}
         vis2 = {n: bool(vis2_raw.get(n, True)) for n in names}
     elif verts_by_cam is not None:
+        mesh1 = _mesh_visibility_payload(verts_by_cam["camera1"])
+        mesh2 = _mesh_visibility_payload(verts_by_cam["camera2"])
         vis1 = compute_visibility_from_mesh_vertices(
             cam1,
-            verts_by_cam["camera1"],
+            mesh1["vertices"],
+            faces=mesh1.get("faces"),
+            camera=mesh1.get("camera"),
+            image_size=mesh1.get("image_size"),
             grid_size=occlusion_grid,
             occlusion_tau=occlusion_tau,
         )
         vis2 = compute_visibility_from_mesh_vertices(
             cam2,
-            verts_by_cam["camera2"],
+            mesh2["vertices"],
+            faces=mesh2.get("faces"),
+            camera=mesh2.get("camera"),
+            image_size=mesh2.get("image_size"),
             grid_size=occlusion_grid,
             occlusion_tau=occlusion_tau,
         )
+        if mesh1.get("camera") is None or mesh2.get("camera") is None:
+            warnings.append(
+                "Using normalized pinhole visibility fallback; camera intrinsics/extrinsics not provided"
+            )
+        elif mesh1.get("faces") is None or mesh2.get("faces") is None:
+            warnings.append("Using projected vertex z-buffer visibility; mesh faces not provided")
+        else:
+            warnings.append("Using projected mesh triangle z-buffer visibility")
     else:
+        warnings.append("No mesh vertices; all joints assumed visible")
         vis1 = {n: True for n in names}
         vis2 = {n: True for n in names}
 
@@ -823,9 +1067,13 @@ def run_phase3_pipeline(
     for n in k2_set:
         cam1_corr[n] = apply_similarity(cam2[n], t21)
 
-    # Bước 5: cập nhật A và suy ra F = P \ A.
-    a_new = sorted(set(a_list) | set(k1_set) | set(k2_set))
-    f_list = [n for n in names if n not in set(a_new)]
+    # Bước 5: chỉ dùng observation thật làm anchor mạnh.
+    # K1/K2 là điểm được suy luận bằng transform, nên không được nâng thành
+    # anchor high-confidence để kéo các joint khác.
+    observed_anchors = sorted(set(a_list))
+    imputed_joints = sorted(set(k1_set) | set(k2_set))
+    a_new = observed_anchors
+    f_list = [n for n in names if n not in set(observed_anchors)]
 
     # TÍNH TRỌNG SỐ ƯU TIÊN CHO TỪNG KHỚP F ĐỂ THỐNG KÊ
     f_weights = {}
@@ -848,9 +1096,10 @@ def run_phase3_pipeline(
         vis2=vis2,
         f_weights=f_weights,
     )
+    before_opt_data = {"camera1": cam1_corr, "camera2": cam2_corr}
     optimized_data, res = optimize_f_points(
-        {"camera1": cam1_corr, "camera2": cam2_corr},
-        a_new,
+        before_opt_data,
+        observed_anchors,
         f_list,
         conf1=conf_cam1,
         conf2=conf_cam2,
@@ -860,6 +1109,33 @@ def run_phase3_pipeline(
         regularization_lambda=regularization_lambda,
         soft_tail_temperature=soft_tail_temperature,
         soft_tail_weight=soft_tail_weight,
+    )
+    if res is not None and not res.success:
+        warnings.append(f"Optimization failed; using pre-optimization pose: {res.message}")
+    attempted_displacement = compute_displacement_report(
+        before_opt_data,
+        optimized_data,
+        f_list,
+    )
+    max_attempted_move = max_displacement_value(attempted_displacement)
+    rejected_by_displacement = bool(
+        reject_excessive_displacement
+        and max_joint_move_m > 0.0
+        and max_attempted_move > float(max_joint_move_m)
+    )
+    if rejected_by_displacement:
+        warnings.append(
+            "Reject optimization: excessive joint displacement "
+            f"({max_attempted_move:.4f} m > {float(max_joint_move_m):.4f} m)"
+        )
+        optimized_data = {
+            "camera1": dict(before_opt_data["camera1"]),
+            "camera2": dict(before_opt_data["camera2"]),
+        }
+    displacement = compute_displacement_report(
+        before_opt_data,
+        optimized_data,
+        f_list,
     )
     # Đo chất lượng sau tối ưu.
     after_stats = calculate_stats(
@@ -881,6 +1157,8 @@ def run_phase3_pipeline(
         "L": l_list,
         "A": a_list,
         "A_new": a_new,
+        "observed_anchors": observed_anchors,
+        "imputed_joints": imputed_joints,
         "F": f_list,
         "before_stats": before_stats,
         "after_stats": after_stats,
@@ -896,6 +1174,11 @@ def run_phase3_pipeline(
             "soft_tail_temperature": float(soft_tail_temperature),
             "soft_tail_weight": float(soft_tail_weight),
         },
+        "displacement": displacement,
+        "attempted_displacement": attempted_displacement,
+        "max_joint_move_m": float(max_joint_move_m),
+        "rejected_by_displacement": rejected_by_displacement,
+        "warnings": warnings,
         "optimized": optimized_data,
         "optimization_result": res,
     }
@@ -914,15 +1197,21 @@ def main():
         "--regularization",
         nargs="?",
         const=True,
-        default=False,
+        default=True,
         type=_parse_bool,
         help="Enable weighted proximity regularization. Accepts true/false.",
     )
     parser.add_argument(
         "--regularization-lambda",
         type=float,
-        default=1.0,
+        default=DEFAULT_REGULARIZATION_LAMBDA,
         help="Lambda weight for weighted proximity regularization.",
+    )
+    parser.add_argument(
+        "--max-joint-move-m",
+        type=float,
+        default=MAX_JOINT_MOVE_M,
+        help="Reject optimized result if any optimized joint moves farther than this.",
     )
     parser.add_argument(
         "--soft-tail-temperature",
@@ -1016,6 +1305,7 @@ def main():
         joint_distance_table=joint_distance_table,
         regularization=args.regularization,
         regularization_lambda=args.regularization_lambda,
+        max_joint_move_m=args.max_joint_move_m,
         soft_tail_temperature=args.soft_tail_temperature,
         soft_tail_weight=args.soft_tail_weight,
     )
@@ -1028,8 +1318,11 @@ def main():
     mean_c2 = float(np.mean(list(result["joint_confidence"]["camera2"].values())))
     print(f"Joint confidence mean: cam1={mean_c1:.3f}, cam2={mean_c2:.3f}")
     print(f"A (RANSAC+Umeyama consensus on L): {result['A']}")
-    print(f"A_new = A U K1 U K2: {result['A_new']}")
+    print(f"A_new = observed anchors only: {result['A_new']}")
+    print(f"Imputed joints (not anchors): {result['imputed_joints']}")
     print(f"F = P \\ A_new: {result['F']}\n")
+    print(f"Warnings: {result['warnings']}")
+    print(f"Rejected by displacement: {result['rejected_by_displacement']}")
 
     q1_i, q3_i, mean_i, med_i = result["before_stats"]
     q1_f, q3_f, mean_f, med_f = result["after_stats"]
